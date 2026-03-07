@@ -1,5 +1,5 @@
-use std::cell::RefCell;
 use std::collections::HashMap;
+use std::sync::Mutex;
 
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
@@ -53,6 +53,14 @@ struct PySearchHit {
     #[pyo3(get)]
     metadata: HashMap<String, String>,
     #[pyo3(get)]
+    modality: String,
+    #[pyo3(get)]
+    embedding_views: Vec<String>,
+    #[pyo3(get)]
+    page_number: Option<usize>,
+    #[pyo3(get)]
+    region_kind: Option<String>,
+    #[pyo3(get)]
     score: f32,
     #[pyo3(get)]
     parent_text: Option<String>,
@@ -67,6 +75,14 @@ impl From<SearchHit> for PySearchHit {
             path: value.path,
             text: value.text,
             metadata: value.metadata.into_iter().collect(),
+            modality: format!("{:?}", value.modality),
+            embedding_views: value
+                .embedding_views
+                .into_iter()
+                .map(|view| format!("{view:?}"))
+                .collect(),
+            page_number: value.page_number,
+            region_kind: value.region_kind,
             score: value.score,
             parent_text: value.parent_text,
         }
@@ -84,6 +100,10 @@ struct PyDocument {
     raw_text: String,
     #[pyo3(get)]
     metadata: HashMap<String, String>,
+    #[pyo3(get)]
+    modality: String,
+    #[pyo3(get)]
+    source_uri: Option<String>,
 }
 
 impl From<Document> for PyDocument {
@@ -93,6 +113,8 @@ impl From<Document> for PyDocument {
             title: value.title,
             raw_text: value.raw_text,
             metadata: value.metadata.into_iter().collect(),
+            modality: format!("{:?}", value.modality),
+            source_uri: value.source_uri,
         }
     }
 }
@@ -124,9 +146,9 @@ impl From<CollectionInfo> for PyCollectionInfo {
     }
 }
 
-#[pyclass(unsendable)]
+#[pyclass]
 struct RustVLite {
-    inner: RefCell<ExactVLite>,
+    inner: Mutex<ExactVLite>,
 }
 
 #[pymethods]
@@ -135,7 +157,7 @@ impl RustVLite {
     fn new(path: String) -> PyResult<Self> {
         let inner = ExactVLite::open(path).map_err(to_py_error)?;
         Ok(Self {
-            inner: RefCell::new(inner),
+            inner: Mutex::new(inner),
         })
     }
 
@@ -148,8 +170,43 @@ impl RustVLite {
     ) -> PyResult<PyAddResult> {
         let result = self
             .inner
-            .borrow_mut()
+            .lock()
+            .expect("mutex poisoned")
             .add_text(text, into_metadata(metadata), document_id)
+            .map_err(to_py_error)?;
+        Ok(result.into())
+    }
+
+    #[pyo3(signature = (pages, metadata=None, document_id=None, source_uri=None))]
+    fn add_pdf_pages(
+        &self,
+        pages: Vec<String>,
+        metadata: Option<HashMap<String, String>>,
+        document_id: Option<String>,
+        source_uri: Option<String>,
+    ) -> PyResult<PyAddResult> {
+        let result = self
+            .inner
+            .lock()
+            .expect("mutex poisoned")
+            .add_pdf(pages, into_metadata(metadata), document_id, source_uri)
+            .map_err(to_py_error)?;
+        Ok(result.into())
+    }
+
+    #[pyo3(signature = (source_uri, metadata=None, document_id=None, caption=None))]
+    fn add_image(
+        &self,
+        source_uri: String,
+        metadata: Option<HashMap<String, String>>,
+        document_id: Option<String>,
+        caption: Option<String>,
+    ) -> PyResult<PyAddResult> {
+        let result = self
+            .inner
+            .lock()
+            .expect("mutex poisoned")
+            .add_image(source_uri, into_metadata(metadata), document_id, caption)
             .map_err(to_py_error)?;
         Ok(result.into())
     }
@@ -166,7 +223,12 @@ impl RustVLite {
             top_k,
             where_filter: Some(into_metadata(where_)).filter(|value| !value.is_empty()),
         };
-        let results = self.inner.borrow().search(request).map_err(to_py_error)?;
+        let results = self
+            .inner
+            .lock()
+            .expect("mutex poisoned")
+            .search(request)
+            .map_err(to_py_error)?;
         Ok(results.into_iter().map(Into::into).collect())
     }
 
@@ -178,7 +240,8 @@ impl RustVLite {
     ) -> Vec<PyDocument> {
         let filter = into_metadata(where_);
         self.inner
-            .borrow()
+            .lock()
+            .expect("mutex poisoned")
             .get_documents(ids.as_deref(), Some(&filter).filter(|value| !value.is_empty()))
             .into_iter()
             .map(Into::into)
@@ -187,17 +250,22 @@ impl RustVLite {
 
     fn delete(&self, ids: Vec<String>) -> PyResult<usize> {
         self.inner
-            .borrow_mut()
+            .lock()
+            .expect("mutex poisoned")
             .delete_documents(&ids)
             .map_err(to_py_error)
     }
 
     fn info(&self) -> PyCollectionInfo {
-        self.inner.borrow().info().into()
+        self.inner.lock().expect("mutex poisoned").info().into()
     }
 
     fn compact(&self) -> PyResult<()> {
-        self.inner.borrow().compact().map_err(to_py_error)
+        self.inner
+            .lock()
+            .expect("mutex poisoned")
+            .compact()
+            .map_err(to_py_error)
     }
 }
 

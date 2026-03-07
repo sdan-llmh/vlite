@@ -1,6 +1,7 @@
 pub mod chunking;
 pub mod config;
 pub mod document;
+pub mod ingest;
 pub mod index;
 pub mod metadata;
 pub mod retrieval;
@@ -10,9 +11,13 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use anyhow::Context;
-use chunking::{Chunker, StructuralChunker};
+use chunking::StructuralChunker;
 use config::VLiteConfig;
-use document::{AddResult, CollectionInfo, Document, SearchHit, Segment, SegmentKind};
+use document::{AddResult, CollectionInfo, Document, EmbeddingViewKind, SearchHit, Segment, SegmentKind};
+use ingest::image::ingest_image_reference;
+use ingest::pdf::ingest_pdf_pages;
+use ingest::text::ingest_text_document;
+use ingest::{IngestedDocument, IngestedSegment};
 use index::{ExactIndex, IndexBackend};
 use metadata::Metadata;
 use retrieval::{EmbedderAdapter, HashedEmbedder, Retriever, SearchRequest};
@@ -67,22 +72,43 @@ impl ExactVLite {
         metadata: Metadata,
         document_id: Option<String>,
     ) -> anyhow::Result<AddResult> {
-        let raw_text = text.into();
         let document_id = document_id.unwrap_or_else(|| Uuid::new_v4().to_string());
-        let title = raw_text
-            .lines()
-            .map(str::trim)
-            .find(|line| !line.is_empty())
-            .map(|line| line.trim_start_matches('#').trim().to_string())
-            .filter(|line| !line.is_empty());
+        let ingested = ingest_text_document(
+            document_id,
+            text.into(),
+            metadata,
+            None,
+            &self.chunker,
+        );
+        self.add_ingested_document(ingested)
+    }
 
-        let document = Document {
-            id: document_id.clone(),
-            title,
-            raw_text: raw_text.clone(),
-            metadata: metadata.clone(),
-        };
+    pub fn add_pdf(
+        &mut self,
+        pages: Vec<String>,
+        metadata: Metadata,
+        document_id: Option<String>,
+        source_uri: Option<String>,
+    ) -> anyhow::Result<AddResult> {
+        let document_id = document_id.unwrap_or_else(|| Uuid::new_v4().to_string());
+        let ingested = ingest_pdf_pages(document_id, pages, metadata, source_uri, &self.chunker);
+        self.add_ingested_document(ingested)
+    }
 
+    pub fn add_image(
+        &mut self,
+        source_uri: String,
+        metadata: Metadata,
+        document_id: Option<String>,
+        caption: Option<String>,
+    ) -> anyhow::Result<AddResult> {
+        let document_id = document_id.unwrap_or_else(|| Uuid::new_v4().to_string());
+        let ingested = ingest_image_reference(document_id, source_uri, metadata, caption);
+        self.add_ingested_document(ingested)
+    }
+
+    fn add_ingested_document(&mut self, ingested: IngestedDocument) -> anyhow::Result<AddResult> {
+        let document_id = ingested.document.id.clone();
         let root_segment_id = format!("{document_id}:root");
         let root_segment = Segment {
             id: root_segment_id.clone(),
@@ -90,35 +116,24 @@ impl ExactVLite {
             parent_id: None,
             kind: SegmentKind::Document,
             path: Vec::new(),
-            text: raw_text.clone(),
-            metadata: metadata.clone(),
-            embedding: self.embedder.embed(&raw_text),
+            text: ingested.document.raw_text.clone(),
+            metadata: ingested.document.metadata.clone(),
+            modality: ingested.document.modality.clone(),
+            embedding_views: vec![EmbeddingViewKind::Dense, EmbeddingViewKind::Lexical],
+            page_number: None,
+            region_kind: Some("document".into()),
+            embedding: self.embedder.embed(&ingested.document.raw_text),
             searchable: false,
         };
 
-        let drafts = self.chunker.chunk_document(&document);
-        let segment_ids = drafts
-            .iter()
-            .enumerate()
-            .map(|(index, draft)| {
-                let segment_id = format!("{document_id}:seg:{index:04}");
-                let segment = Segment {
-                    id: segment_id.clone(),
-                    document_id: document_id.clone(),
-                    parent_id: Some(root_segment_id.clone()),
-                    kind: draft.kind.clone(),
-                    path: draft.path.clone(),
-                    text: draft.text.clone(),
-                    metadata: metadata.clone(),
-                    embedding: self.embedder.embed(&draft.text),
-                    searchable: true,
-                };
-                self.segments.insert(segment_id.clone(), segment);
-                segment_id
-            })
+        let segment_ids = ingested
+            .segments
+            .into_iter()
+            .map(|segment| self.materialize_segment(&document_id, &root_segment_id, segment))
             .collect::<Vec<_>>();
 
-        self.documents.insert(document_id.clone(), document);
+        self.documents
+            .insert(document_id.clone(), ingested.document);
         self.segments.insert(root_segment_id, root_segment);
         self.persist()?;
 
@@ -127,6 +142,40 @@ impl ExactVLite {
             segment_ids: segment_ids.clone(),
             chunk_count: segment_ids.len(),
         })
+    }
+
+    fn materialize_segment(
+        &mut self,
+        document_id: &str,
+        root_segment_id: &str,
+        segment: IngestedSegment,
+    ) -> String {
+        let segment_id = format!("{document_id}:{}", segment.key);
+        let parent_id = segment.parent_key.as_ref().map(|parent_key| {
+            if parent_key == "root" {
+                root_segment_id.to_string()
+            } else {
+                format!("{document_id}:{parent_key}")
+            }
+        });
+
+        let record = Segment {
+            id: segment_id.clone(),
+            document_id: document_id.to_string(),
+            parent_id,
+            kind: segment.kind,
+            path: segment.path,
+            text: segment.text.clone(),
+            metadata: segment.metadata,
+            modality: segment.modality,
+            embedding_views: segment.embedding_views,
+            page_number: segment.page_number,
+            region_kind: segment.region_kind,
+            embedding: self.embedder.embed(&segment.text),
+            searchable: segment.searchable,
+        };
+        self.segments.insert(segment_id.clone(), record);
+        segment_id
     }
 
     pub fn get_documents(
@@ -207,6 +256,10 @@ impl Retriever for ExactVLite {
                 path: segment.path.clone(),
                 text: segment.text.clone(),
                 metadata: segment.metadata.clone(),
+                modality: segment.modality.clone(),
+                embedding_views: segment.embedding_views.clone(),
+                page_number: segment.page_number,
+                region_kind: segment.region_kind.clone(),
                 score,
                 parent_text: segment
                     .parent_id

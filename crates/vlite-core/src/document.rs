@@ -2,11 +2,27 @@ use crate::metadata::Metadata;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum Modality {
+    Text,
+    Pdf,
+    Image,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum EmbeddingViewKind {
+    Dense,
+    Lexical,
+    PageImage,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Document {
     pub id: String,
     pub title: Option<String>,
     pub raw_text: String,
     pub metadata: Metadata,
+    pub modality: Modality,
+    pub source_uri: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -27,6 +43,10 @@ pub struct Segment {
     pub path: Vec<String>,
     pub text: String,
     pub metadata: Metadata,
+    pub modality: Modality,
+    pub embedding_views: Vec<EmbeddingViewKind>,
+    pub page_number: Option<usize>,
+    pub region_kind: Option<String>,
     pub embedding: Vec<f32>,
     pub searchable: bool,
 }
@@ -46,6 +66,10 @@ pub struct SearchHit {
     pub path: Vec<String>,
     pub text: String,
     pub metadata: Metadata,
+    pub modality: Modality,
+    pub embedding_views: Vec<EmbeddingViewKind>,
+    pub page_number: Option<usize>,
+    pub region_kind: Option<String>,
     pub score: f32,
     pub parent_text: Option<String>,
 }

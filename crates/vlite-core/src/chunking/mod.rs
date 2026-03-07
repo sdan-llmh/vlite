@@ -89,7 +89,7 @@ impl Chunker for StructuralChunker {
 #[cfg(test)]
 mod tests {
     use super::{Chunker, StructuralChunker};
-    use crate::document::Document;
+    use crate::document::{Document, Modality};
     use crate::metadata::Metadata;
 
     #[test]
@@ -99,6 +99,8 @@ mod tests {
             title: Some("Example".into()),
             raw_text: "# Intro\nHello world.\n\n# Details\nSecond paragraph.".into(),
             metadata: Metadata::new(),
+            modality: Modality::Text,
+            source_uri: None,
         };
 
         let chunker = StructuralChunker;

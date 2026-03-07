@@ -1,13 +1,42 @@
 import os
 import re
-import PyPDF2
-import docx2txt
-import pandas as pd
-import requests
-from bs4 import BeautifulSoup
-from typing import List
-import tiktoken
-import numpy as np
+import importlib
+import importlib.util
+from pathlib import Path
+from typing import List, Optional
+try:
+    import PyPDF2
+except ImportError:  # pragma: no cover - optional dependency
+    PyPDF2 = None
+try:
+    import docx2txt
+except ImportError:  # pragma: no cover - optional dependency
+    docx2txt = None
+
+try:
+    import pandas as pd
+except ImportError:  # pragma: no cover - optional dependency
+    pd = None
+
+try:
+    import requests
+except ImportError:  # pragma: no cover - optional dependency
+    requests = None
+
+try:
+    from bs4 import BeautifulSoup
+except ImportError:  # pragma: no cover - optional dependency
+    BeautifulSoup = None
+
+try:
+    import tiktoken
+except ImportError:  # pragma: no cover - optional dependency
+    tiktoken = None
+
+try:
+    import numpy as np
+except ImportError:  # pragma: no cover - optional dependency
+    np = None
 import itertools
 import platform
 import subprocess
@@ -22,16 +51,57 @@ try:
 except ImportError:
     run_ocr = None
 
+
+def _require_dependency(name, module):
+    if module is None:
+        raise ImportError(f"{name} is required for this operation but is not installed.")
+
+
+def load_rust_vlite_module(search_paths: Optional[List[str]] = None):
+    """
+    Load the optional Rust VLite extension, either from the active Python environment
+    or directly from a built shared library in the repository.
+    """
+    try:
+        return importlib.import_module("vlite_py")
+    except ImportError:
+        pass
+
+    candidate_paths = [Path(path) for path in (search_paths or [])]
+    workspace_root = Path(__file__).resolve().parents[1]
+    candidate_paths.extend(
+        [
+            workspace_root / "target" / "debug" / "libvlite_py.so",
+            workspace_root / "target" / "release" / "libvlite_py.so",
+        ]
+    )
+
+    for candidate in candidate_paths:
+        if not candidate.exists():
+            continue
+        spec = importlib.util.spec_from_file_location("vlite_py", candidate)
+        if spec and spec.loader:
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            return module
+
+    raise ImportError("Could not locate the optional Rust VLite extension.")
+
+
+def create_rust_vlite(path: str, search_paths: Optional[List[str]] = None):
+    module = load_rust_vlite_module(search_paths=search_paths)
+    return module.open_local(path)
+
 def chop_and_chunk(text, max_seq_length=512, fast=False):
     """
     Chop text into chunks of max_seq_length tokens or max_seq_length*4 characters (fast mode).
     """
     if isinstance(text, str):
         text = [text]
-    enc = tiktoken.get_encoding("cl100k_base")
+    enc = tiktoken.get_encoding("cl100k_base") if tiktoken is not None else None
     chunks = []
     for t in text:
-        if fast:
+        if fast or enc is None:
             chunk_size = max_seq_length * 4
             chunks.extend([t[i:i + chunk_size] for i in range(0, len(t), chunk_size)])
         else:
@@ -77,6 +147,7 @@ def process_pdf(file_path: str, chunk_size: int = 512, use_ocr: bool = False, la
         print(predictions)
         text = [' '.join(result.text for result in prediction.text_lines) for prediction in predictions]
     else:
+        _require_dependency("PyPDF2", PyPDF2)
         print(f"Not using OCR for {file_path}")
         with open(file_path, 'rb') as file:
             pdf_reader = PyPDF2.PdfReader(file)
@@ -85,6 +156,35 @@ def process_pdf(file_path: str, chunk_size: int = 512, use_ocr: bool = False, la
                 text += page.extract_text()
     
     return chop_and_chunk(text, chunk_size)
+
+
+def process_pdf_pages(file_path: str, use_ocr: bool = False, langs: List[str] = None) -> List[str]:
+    """
+    Extract page-level text from a PDF for page-aware ingestion in the Rust core.
+    """
+    if use_ocr:
+        if run_ocr is None:
+            raise ImportError("OCR functionality is not available. Please install vlite with OCR support: pip install vlite[ocr]")
+        if langs is None:
+            langs = ["en"]
+
+        det_processor, det_model = segformer.load_processor(), segformer.load_model()
+        rec_model, rec_processor = load_model(), load_processor()
+        image, _ = load_pdf(file_path, max_pages=len(file_path), start_page=0)
+        langs = ["en"] * len(image)
+        predictions = run_ocr(image, langs, det_model, det_processor, rec_model, rec_processor)
+        return [
+            " ".join(result.text for result in prediction.text_lines).strip()
+            for prediction in predictions
+        ]
+
+    _require_dependency("PyPDF2", PyPDF2)
+    with open(file_path, "rb") as file:
+        pdf_reader = PyPDF2.PdfReader(file)
+        pages = []
+        for page in pdf_reader.pages:
+            pages.append((page.extract_text() or "").strip())
+    return pages
 
 def process_txt(file_path: str, chunk_size: int = 512) -> List[str]:
     """
@@ -113,6 +213,7 @@ def process_docx(file_path: str, chunk_size: int = 512) -> List[str]:
     Returns:
         List[str]: A list of text chunks.
     """
+    _require_dependency("docx2txt", docx2txt)
     text = docx2txt.process(file_path)
     return chop_and_chunk(text, chunk_size)
 
@@ -126,6 +227,7 @@ def process_csv(file_path: str) -> List[str]:
     Returns:
         List[str]: A list of rows as strings.
     """
+    _require_dependency("pandas", pd)
     df = pd.read_csv(file_path)
     rows = df.astype(str).values.tolist()
     return rows
@@ -161,6 +263,8 @@ def process_webpage(url: str, chunk_size: int = 512) -> List[str]:
     Returns:
         List[str]: A list of text chunks.
     """
+    _require_dependency("requests", requests)
+    _require_dependency("beautifulsoup4", BeautifulSoup)
     response = requests.get(url)
     soup = BeautifulSoup(response.text, 'html.parser')
     text = soup.get_text()
@@ -203,6 +307,7 @@ def process_file(file_path: str, chunk_size: int = 512) -> List[str]:
 ## Other functions
 
 def cos_sim(a, b):
+    _require_dependency("numpy", np)
     sims = a @ b.T
     sims /= np.linalg.norm(a) * np.linalg.norm(b, axis=1)
     return sims
@@ -215,6 +320,7 @@ def visualize_tokens(token_values: List[str]) -> None:
     print(("".join(interleaved) + "\u001b[0m"))
 
 def load_file(pdf_path):
+    _require_dependency("PyPDF2", PyPDF2)
     extracted_text = []
     with open(pdf_path, "rb") as file:
         reader = PyPDF2.PdfReader(file)
@@ -223,6 +329,8 @@ def load_file(pdf_path):
     return extracted_text
 
 def count_tokens(text):
+    if tiktoken is None:
+        return len(text.split())
     enc = tiktoken.get_encoding("cl100k_base")
     token_ids = enc.encode(text, disallowed_special=())
     return len(token_ids)
@@ -238,3 +346,20 @@ def check_mps_available():
     if platform.system() == "Darwin" or platform.processor().upper() == "ARM":
         return True
     return False
+
+
+def add_pdf_to_rust_vlite(
+    db,
+    file_path: str,
+    metadata: Optional[dict] = None,
+    document_id: Optional[str] = None,
+    use_ocr: bool = False,
+    langs: Optional[List[str]] = None,
+):
+    pages = process_pdf_pages(file_path, use_ocr=use_ocr, langs=langs)
+    return db.add_pdf_pages(
+        pages,
+        metadata or {},
+        document_id,
+        file_path,
+    )
