@@ -1,0 +1,46 @@
+[package]
+name = "vlite"
+version = "1.0.0"
+edition = "2021"
+description = "a simple and blazing fast vector database"
+license = "AGPL-3.0"
+readme = "README.md"
+repository = "https://github.com/sdan/vlite"
+keywords = ["vector", "database", "embedding", "search", "rag"]
+categories = ["database", "science"]
+
+[dependencies]
+# The embedding engine — ONNX Runtime for blazing fast inference
+ort = { version = "2.0.0-rc.12", features = ["load-dynamic"] }
+ndarray = "0.16"
+tokenizers = { version = "0.21", default-features = false, features = ["progressbar", "onig"] }
+hf-hub = "0.4"
+
+# The search kernel — 200x faster cosine via SIMD
+simsimd = "6"
+
+# Storage & types
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bytemuck = { version = "1", features = ["derive"] }
+
+# PDF & HTML extraction
+pdf-extract = "0.10"
+
+# Basics
+thiserror = "2"
+
+# Image processing (for CLIP vision embedder)
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[features]
+default = []
+rerank = []          # Cross-encoder reranking (downloads extra 87MB model)
+hnsw = ["dep:usearch"]  # HNSW index for >100K vectors
+
+[dependencies.usearch]
+version = "2"
+optional = true
