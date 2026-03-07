@@ -1,0 +1,15 @@
+[package]
+name = "vlite-py"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0"
+description = "Python bindings for the next-generation VLite Rust core"
+
+[lib]
+name = "vlite_py"
+crate-type = ["cdylib"]
+
+[dependencies]
+anyhow = "1"
+pyo3 = { version = "0.22", features = ["abi3-py310", "extension-module"] }
+vlite-core = { path = "../vlite-core" }

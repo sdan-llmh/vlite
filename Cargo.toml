@@ -1,0 +1,6 @@
+[workspace]
+members = [
+  "crates/vlite-core",
+  "crates/vlite-py",
+]
+resolver = "2"

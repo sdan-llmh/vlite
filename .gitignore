@@ -28,6 +28,7 @@ __pycache__
 .Python
 build/
 dist/
+target/
 *.egg
 *.egg-info/
 eggs/
