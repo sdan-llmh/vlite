@@ -346,6 +346,258 @@ fn rrf(lists: &[Vec<(usize, f32)>], k: f32) -> Vec<(usize, f32)> {
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Embedder: ONNX text embedding (requires `embed` feature)
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+/// ONNX-based text embedder. Wraps a sentence-transformer model.
+///
+/// Enable with the `embed` feature flag.
+#[cfg(feature = "embed")]
+pub struct Embedder {
+    session: std::sync::Mutex<ort::session::Session>,
+    tokenizer: tokenizers::Tokenizer,
+    dim: usize,
+}
+
+#[cfg(feature = "embed")]
+impl Embedder {
+    /// Load an ONNX embedding model from a directory.
+    ///
+    /// The directory should contain `model.onnx` and `tokenizer.json`.
+    /// Compatible with sentence-transformers models exported to ONNX
+    /// (e.g., all-MiniLM-L6-v2).
+    pub fn load(model_dir: &str) -> Result<Self> {
+        let model_path = Path::new(model_dir).join("model.onnx");
+        let tokenizer_path = Path::new(model_dir).join("tokenizer.json");
+
+        let session = ort::session::Session::builder()?
+            .with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level3)?
+            .with_intra_threads(4)?
+            .commit_from_file(&model_path)?;
+
+        // Detect dimension from model output shape (default to 384 if undetectable)
+        let dim = session
+            .outputs()
+            .first()
+            .and_then(|o| o.dtype().tensor_shape().and_then(|s| s.last().copied()))
+            .map(|d| d as usize)
+            .unwrap_or(384);
+
+        let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
+            .map_err(|e| format!("Failed to load tokenizer: {e}"))?;
+
+        Ok(Self {
+            session: std::sync::Mutex::new(session),
+            tokenizer,
+            dim,
+        })
+    }
+
+    /// Embedding dimension.
+    pub fn dimension(&self) -> usize {
+        self.dim
+    }
+
+    /// Embed a single text into a vector.
+    pub fn embed(&self, text: &str) -> Result<Vec<f32>> {
+        let batch = self.embed_batch(&[text])?;
+        Ok(batch.into_iter().next().unwrap_or_default())
+    }
+
+    /// Embed a batch of texts into vectors.
+    pub fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+        let encodings = self
+            .tokenizer
+            .encode_batch(texts.to_vec(), true)
+            .map_err(|e| format!("Tokenization failed: {e}"))?;
+
+        let max_len = encodings.iter().map(|e| e.get_ids().len()).max().unwrap_or(0);
+        let batch_size = encodings.len();
+
+        // Flatten input tensors as 1D vectors with known shapes
+        let mut ids_flat = vec![0i64; batch_size * max_len];
+        let mut mask_flat = vec![0i64; batch_size * max_len];
+        let mut ttids_flat = vec![0i64; batch_size * max_len];
+
+        for (i, enc) in encodings.iter().enumerate() {
+            for (j, &id) in enc.get_ids().iter().enumerate() {
+                ids_flat[i * max_len + j] = id as i64;
+            }
+            for (j, &mask) in enc.get_attention_mask().iter().enumerate() {
+                mask_flat[i * max_len + j] = mask as i64;
+            }
+            for (j, &tt) in enc.get_type_ids().iter().enumerate() {
+                ttids_flat[i * max_len + j] = tt as i64;
+            }
+        }
+
+        let shape = vec![batch_size as i64, max_len as i64];
+        let input_ids_val = ort::value::Tensor::from_array((shape.clone(), ids_flat))?;
+        let attention_mask_val = ort::value::Tensor::from_array((shape.clone(), mask_flat))?;
+        let token_type_ids_val = ort::value::Tensor::from_array((shape, ttids_flat))?;
+
+        let mut session = self.session.lock().map_err(|e| format!("Lock poisoned: {e}"))?;
+        let outputs = session.run(ort::inputs![
+            "input_ids" => input_ids_val,
+            "attention_mask" => attention_mask_val,
+            "token_type_ids" => token_type_ids_val,
+        ])?;
+
+        // Get the first output tensor
+        let output_value = outputs.values().next().ok_or("No output tensor found")?;
+        let (out_shape, out_data) = output_value.try_extract_tensor::<f32>()?;
+
+        // Mean pooling over token dimension, respecting attention mask
+        let mut results = Vec::with_capacity(batch_size);
+        let is_3d = out_shape.len() == 3;
+        let hidden_size = out_shape.last().copied().unwrap_or(self.dim as i64) as usize;
+
+        for i in 0..batch_size {
+            let seq_len = encodings[i].get_attention_mask().iter().filter(|&&m| m == 1).count();
+            let mut pooled = vec![0.0f32; hidden_size];
+
+            if is_3d {
+                let seq_dim = out_shape[1] as usize;
+                for j in 0..seq_len {
+                    for k in 0..hidden_size {
+                        pooled[k] += out_data[i * seq_dim * hidden_size + j * hidden_size + k];
+                    }
+                }
+                if seq_len > 0 {
+                    for v in &mut pooled {
+                        *v /= seq_len as f32;
+                    }
+                }
+            } else {
+                // Already pooled (2D output)
+                for k in 0..hidden_size {
+                    pooled[k] = out_data[i * hidden_size + k];
+                }
+            }
+
+            // L2 normalize
+            let norm: f32 = pooled.iter().map(|x| x * x).sum::<f32>().sqrt();
+            if norm > 0.0 {
+                for v in &mut pooled {
+                    *v /= norm;
+                }
+            }
+            results.push(pooled);
+        }
+
+        Ok(results)
+    }
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Reranker: cross-encoder via ONNX (requires `embed` feature)
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+/// Cross-encoder reranker. Scores (query, document) pairs for relevance.
+///
+/// Use a model like `cross-encoder/ms-marco-MiniLM-L6-v2` exported to ONNX.
+/// Adds ~+33% retrieval accuracy for ~120ms latency.
+///
+/// Enable with the `embed` feature flag.
+#[cfg(feature = "embed")]
+pub struct Reranker {
+    session: std::sync::Mutex<ort::session::Session>,
+    tokenizer: tokenizers::Tokenizer,
+}
+
+#[cfg(feature = "embed")]
+impl Reranker {
+    /// Load a cross-encoder ONNX model from a directory.
+    ///
+    /// The directory should contain `model.onnx` and `tokenizer.json`.
+    pub fn load(model_dir: &str) -> Result<Self> {
+        let model_path = Path::new(model_dir).join("model.onnx");
+        let tokenizer_path = Path::new(model_dir).join("tokenizer.json");
+
+        let session = ort::session::Session::builder()?
+            .with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level3)?
+            .with_intra_threads(4)?
+            .commit_from_file(&model_path)?;
+
+        let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
+            .map_err(|e| format!("Failed to load tokenizer: {e}"))?;
+
+        Ok(Self {
+            session: std::sync::Mutex::new(session),
+            tokenizer,
+        })
+    }
+
+    /// Score (query, document) pairs. Returns one relevance score per document.
+    ///
+    /// Higher scores indicate greater relevance.
+    pub fn score(&self, query: &str, documents: &[&str]) -> Result<Vec<f32>> {
+        if documents.is_empty() {
+            return Ok(vec![]);
+        }
+
+        // Cross-encoder input: pairs of (query, document)
+        let pairs: Vec<_> = documents
+            .iter()
+            .map(|doc| tokenizers::EncodeInput::Dual(query.into(), (*doc).into()))
+            .collect();
+
+        let encodings = self
+            .tokenizer
+            .encode_batch(pairs, true)
+            .map_err(|e| format!("Tokenization failed: {e}"))?;
+
+        let max_len = encodings.iter().map(|e| e.get_ids().len()).max().unwrap_or(0);
+        let batch_size = encodings.len();
+
+        let mut ids_flat = vec![0i64; batch_size * max_len];
+        let mut mask_flat = vec![0i64; batch_size * max_len];
+        let mut ttids_flat = vec![0i64; batch_size * max_len];
+
+        for (i, enc) in encodings.iter().enumerate() {
+            for (j, &id) in enc.get_ids().iter().enumerate() {
+                ids_flat[i * max_len + j] = id as i64;
+            }
+            for (j, &mask) in enc.get_attention_mask().iter().enumerate() {
+                mask_flat[i * max_len + j] = mask as i64;
+            }
+            for (j, &tt) in enc.get_type_ids().iter().enumerate() {
+                ttids_flat[i * max_len + j] = tt as i64;
+            }
+        }
+
+        let shape = vec![batch_size as i64, max_len as i64];
+        let input_ids_val = ort::value::Tensor::from_array((shape.clone(), ids_flat))?;
+        let attention_mask_val = ort::value::Tensor::from_array((shape.clone(), mask_flat))?;
+        let token_type_ids_val = ort::value::Tensor::from_array((shape, ttids_flat))?;
+
+        let mut session = self.session.lock().map_err(|e| format!("Lock poisoned: {e}"))?;
+        let outputs = session.run(ort::inputs![
+            "input_ids" => input_ids_val,
+            "attention_mask" => attention_mask_val,
+            "token_type_ids" => token_type_ids_val,
+        ])?;
+
+        // Cross-encoder output: logits tensor of shape (batch_size, 1) or (batch_size,)
+        let output_value = outputs.values().next().ok_or("No output tensor from reranker")?;
+        let (out_shape, out_data) = output_value.try_extract_tensor::<f32>()?;
+
+        let scores: Vec<f32> = (0..batch_size)
+            .map(|i| {
+                if out_shape.len() == 2 {
+                    let cols = out_shape[1] as usize;
+                    out_data[i * cols]
+                } else {
+                    out_data[i]
+                }
+            })
+            .collect();
+
+        Ok(scores)
+    }
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // VLite: the whole database
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -702,6 +954,110 @@ impl VLite {
         self.index = Index::new(&opts)?;
         self.index.reserve(1024)?;
         Ok(())
+    }
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// PDF support (requires `pdf` feature)
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+#[cfg(feature = "pdf")]
+impl VLite {
+    /// Add a PDF document. Extracts text per page, chunks, and indexes.
+    ///
+    /// Each chunk is tagged with metadata `{page: N, source: source_name}`.
+    /// Returns the parent chunk IDs created.
+    pub fn add_pdf(&mut self, pdf_bytes: &[u8], source_name: &str) -> Result<Vec<usize>> {
+        let text = pdf_extract::extract_text_from_mem(pdf_bytes)
+            .map_err(|e| format!("PDF extraction failed: {e}"))?;
+
+        // Split on form-feed characters (page breaks in PDF extract output)
+        let pages: Vec<&str> = text.split('\u{000C}').collect();
+        let mut all_ids = Vec::new();
+
+        for (page_num, page_text) in pages.iter().enumerate() {
+            let trimmed = page_text.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let mut meta = HashMap::new();
+            meta.insert("page".to_string(), (page_num + 1).to_string());
+            meta.insert("source".to_string(), source_name.to_string());
+            let ids = self.add_with_metadata(trimmed, meta)?;
+            all_ids.extend(ids);
+        }
+
+        Ok(all_ids)
+    }
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Reranked search (requires `embed` feature)
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+#[cfg(feature = "embed")]
+impl VLite {
+    /// Full three-stage search pipeline with cross-encoder reranking.
+    ///
+    /// Stage 1: BM25 + vector retrieval (fast, high recall)
+    /// Stage 2: RRF fusion (zero calibration)
+    /// Stage 3: Cross-encoder reranking (+33% accuracy)
+    ///
+    /// Requires an [`Embedder`] for query embedding and optionally a [`Reranker`].
+    pub fn search_reranked(
+        &self,
+        query: &str,
+        top_k: usize,
+        embedder: &Embedder,
+        reranker: Option<&Reranker>,
+    ) -> Result<Vec<SearchResult>> {
+        let k = self.config.retrieval_k.max(top_k);
+
+        // Stage 1: Retrieve
+        let query_vec = embedder.embed(query)?;
+        let bm25_results = self.bm25.search(query, k);
+
+        let vec_results = if self.index.size() > 0 {
+            let results = self.index.search(&query_vec, k)?;
+            results
+                .keys
+                .iter()
+                .zip(results.distances.iter())
+                .map(|(&key, &dist)| (key as usize, 1.0 - dist))
+                .collect()
+        } else {
+            vec![]
+        };
+
+        // Stage 2: RRF fusion
+        let fused = rrf(&[vec_results, bm25_results], 60.0);
+
+        // Stage 3: Rerank (optional)
+        let ranked = if let Some(reranker) = reranker {
+            let candidates: Vec<&str> = fused
+                .iter()
+                .take(k * 2)
+                .filter_map(|(id, _)| self.child_texts.get(*id).map(|s| s.as_str()))
+                .collect();
+
+            if candidates.is_empty() {
+                fused
+            } else {
+                let scores = reranker.score(query, &candidates)?;
+                let mut scored: Vec<(usize, f32)> = fused
+                    .iter()
+                    .take(candidates.len())
+                    .zip(scores.iter())
+                    .map(|(&(id, _), &score)| (id, score))
+                    .collect();
+                scored.sort_by(|a, b| b.1.total_cmp(&a.1));
+                scored
+            }
+        } else {
+            fused
+        };
+
+        self.children_to_results(ranked, top_k)
     }
 }
 

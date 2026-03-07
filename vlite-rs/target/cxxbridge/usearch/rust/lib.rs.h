@@ -1,1 +1,1 @@
-../../../debug/build/usearch-9547e923b7ff4eeb/out/cxxbridge/include/usearch/rust/lib.rs.h
+../../../debug/build/usearch-a4971e45f43906d0/out/cxxbridge/include/usearch/rust/lib.rs.h

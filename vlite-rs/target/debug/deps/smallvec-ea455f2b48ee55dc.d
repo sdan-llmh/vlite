@@ -1,0 +1,5 @@
+/workspace/vlite-rs/target/debug/deps/smallvec-ea455f2b48ee55dc.d: /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/smallvec-1.15.1/src/lib.rs
+
+/workspace/vlite-rs/target/debug/deps/libsmallvec-ea455f2b48ee55dc.rmeta: /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/smallvec-1.15.1/src/lib.rs
+
+/usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/smallvec-1.15.1/src/lib.rs:
