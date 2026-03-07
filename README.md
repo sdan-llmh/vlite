@@ -1,86 +1,102 @@
 # vlite
 
-a simple and blazing fast vector database
+VLite is transitioning into a **Rust-core, local-first vector database** for the 2026 retrieval stack.
 
-there is no database you need to set up, no server to run, and no complex configuration. just install vlite and start using it. take the CTX file with you wherever you go. its like a browser cookie but with embeddings.
+The goal is simple:
 
-![1a3e85a6-2a3f-4092-beea-8b9d69433e80](https://github.com/sdan/vlite/assets/22898443/ed21a28e-8e2a-449b-b737-4603e4f8d0bd)
+- **SQLite-like ergonomics**
+- **Rust speed on the hot path**
+- **multimodal ingestion**
+- **modern auto chunking**
+- **an extensible path from exact search to disk-native ANN**
 
-## Features
+The current repository still contains the original Python implementation. This branch starts the migration toward a next-generation architecture.
 
-- 🔥 *Fastest* vector db retrieval with binary embeddings, less than 1.1s to search 500k documents
-- 🔋 Made for RAG -- with embedding generation with [mixedbread embed-large](https://huggingface.co/mixedbread-ai/mxbai-embed-large-v1) baked in
-- 🍪 CTX (context) file format, a novel abstraction for storing user context similar to browser cookies
-- Ingest text, PDF, CSV, PPTX, and webpages
-- Chunking, metadata filtering, PDF OCR support for extracting text from scanned PDFs
-- **>77.95% faster than Chroma on indexing, >422% faster on retrieval, and >3.6x smaller on disk**
-- 🦜 [Available in LangChain](https://python.langchain.com/docs/integrations/vectorstores/vlite/) since vlite v0.2.2
+## Why VLite is changing
 
+The existing package proved out a useful developer experience:
 
-## Installation
+- no server required
+- easy local persistence
+- simple Python API
 
-```bash
-pip install vlite
-```
+But modern retrieval systems need more than a flat embedding store:
 
-### Installation with PDF OCR Support
+- better document structure preservation
+- multimodal ingestion
+- stronger metadata and provenance
+- higher-quality chunking defaults
+- a Rust systems core for long-term performance and extensibility
 
-To enable PDF OCR support (with [surya](https://github.com/VikParuchuri/surya)), install the `vlite[ocr]` extra:
+## Design direction
 
-```bash
-pip install vlite[ocr]
-```
+The new direction combines ideas from the current state of the art:
 
-## Usage
+- **CoreNN / DiskANN / FreshDiskANN** for single-node scale and disk-native thinking
+- **Qdrant** for named vectors, filtering, and practical vector primitives
+- **LanceDB** for embedded multimodal ergonomics
+- **Contextual Retrieval, Late Chunking, ColPali, and vision-guided chunking** for higher-quality modern RAG
+
+The product stance is intentionally opinionated:
+
+- embedded first
+- small public API
+- structural chunking by default
+- hybrid retrieval by default
+- parent-child document context preserved
+
+## Planned architecture
+
+VLite is being redesigned around:
+
+- a **Rust core** for storage, chunk planning, filtering, and retrieval
+- a **thin Python layer** for compatibility and notebook ergonomics
+- a **document graph** model instead of anonymous flat chunks
+- **adaptive chunking** across text, PDFs, and richer multimodal inputs
+- a **simple exact-search backend first**, with room for future ANN backends
+
+See the design docs for details:
+
+- [`docs/next-gen-rust-vector-db-design.md`](docs/next-gen-rust-vector-db-design.md)
+- [`docs/rust-vector-db-landscape.md`](docs/rust-vector-db-landscape.md)
+- [`docs/chunking-retrieval-strategy.md`](docs/chunking-retrieval-strategy.md)
+
+## Current status
+
+This repository currently contains:
+
+- the legacy Python implementation under `vlite/`
+- new design documentation for the Rust-core migration
+- an in-progress Rust workspace scaffold on this branch
+
+During the migration, the old Python implementation remains useful as a compatibility layer and reference point, but it is **not** the final architecture.
+
+## Legacy Python usage
+
+The existing Python API still looks like:
 
 ```python
 from vlite import VLite
-from vlite.utils import process_pdf
 
-vdb = VLite()
-vdb.add("hello world", metadata={"artist": "adele"})
-vdb.add(process_pdf("attention-is-all-you-need.pdf", use_ocr=True))
-
-results = vdb.retrieve("how do transformers work?")
+db = VLite()
+db.add("hello world", metadata={"artist": "adele"})
+results = db.retrieve("hello")
 print(results)
 ```
 
-### Usage with LangChain
-```python
-from langchain.document_loaders import TextLoader
-from langchain.text_splitter import CharacterTextSplitter
-from langchain.vectorstores import VLite
+That API will be preserved or closely mirrored where practical, but the implementation beneath it is moving toward Rust.
 
-# Load the document and split it into chunks
-loader = TextLoader("path/to/document.txt")
-documents = loader.load()
+## Principles
 
-# Create a VLite instance
-vlite = VLite(collection="my_collection")
+VLite should eventually feel like:
 
-# Add documents to the VLite vector database
-vlite.add_documents(documents)
-
-# Perform a similarity search
-query = "What is the main topic of the document?"
-docs = vlite.similarity_search(query)
-
-# Print the most relevant document
-print(docs[0].page_content)
-```
-
-## About
-
-vlite is a vector database built for agents, ChatGPT Plugins, and other AI apps that need a fast and simple database to store vectors. It was developed to support the billions of embeddings generated, indexed, and sorted with [ChatWith+ ChatGPT Plugins](https://plugins.sdan.io/), which run for millions of users. Most vector databases either repeatedly crashed on a daily basis or were too expensive for the high throughput required.
-
-vlite introduces the CTX file format, which acts like a browser cookie for user embeddings, providing efficient storage, retrieval of embeddings, composability, portability, and user context.
-
-![converted copy](https://github.com/sdan/vlite/assets/22898443/1b5b330d-0094-4da1-8d01-302255aa2010)
+- one local file or directory
+- one object
+- one obvious `add(...)`
+- one obvious `search(...)`
+- strong defaults
+- escape hatches for advanced retrieval strategies
 
 ## License
 
 AGPL-3.0 License
-
-## Contributing
-
-Thanks to [Claude](https://claude.ai) and [Ray](https://github.com/raydelvecchio) for their contributions to vlite. If you'd like to contribute, please open an issue or a pull request.
