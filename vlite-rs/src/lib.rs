@@ -345,10 +345,15 @@ impl VLite {
     }
 
     /// BM25 score for a single document against query terms.
-    /// Same algorithm as Elasticsearch — 10 lines.
+    /// Same algorithm as Elasticsearch — whole-word matching, not substring.
     fn bm25_score(&self, query_terms: &[String], doc_idx: usize) -> f32 {
         let doc_len = self.doc_lens[doc_idx] as f32;
-        let text_lower = self.texts[doc_idx].to_lowercase();
+        // Tokenize document into words (same normalization as df index)
+        let doc_words: Vec<String> = self.texts[doc_idx]
+            .split_whitespace()
+            .map(|w| w.to_lowercase().chars().filter(|c| c.is_alphanumeric()).collect::<String>())
+            .filter(|s| !s.is_empty())
+            .collect();
         let n = self.len() as f32;
         let k1: f32 = 1.5;
         let b: f32 = 0.75;
@@ -361,7 +366,8 @@ impl VLite {
         query_terms
             .iter()
             .map(|term| {
-                let tf = text_lower.matches(term.as_str()).count() as f32;
+                // Whole-word match: count occurrences of term in document words
+                let tf = doc_words.iter().filter(|w| *w == term).count() as f32;
                 let df = self.df.get(term).copied().unwrap_or(0) as f32;
                 let idf = ((n - df + 0.5) / (df + 0.5) + 1.0).ln();
                 idf * (tf * (k1 + 1.0)) / (tf + k1 * (1.0 - b + b * doc_len / avg_dl))
