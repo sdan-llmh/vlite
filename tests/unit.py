@@ -29,6 +29,24 @@ def test_add_search_get_and_delete_round_trip(rust_db):
     assert rust_db.get(["doc-alpha"], None) == []
 
 
+def test_add_many_batches_persist_once(rust_db):
+    results = rust_db.add_many(
+        [
+            "# One\nFirst doc",
+            "# Two\nSecond doc",
+            "# Three\nThird doc",
+        ],
+        {"batch": "yes"},
+        ["doc-1", "doc-2", "doc-3"],
+    )
+
+    assert [result.document_id for result in results] == ["doc-1", "doc-2", "doc-3"]
+
+    docs = rust_db.get(None, {"batch": "yes"})
+    assert len(docs) == 3
+    assert {doc.id for doc in docs} == {"doc-1", "doc-2", "doc-3"}
+
+
 def test_pdf_ingestion_keeps_page_provenance(rust_db):
     added = rust_db.add_pdf_pages(
         [

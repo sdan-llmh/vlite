@@ -80,7 +80,31 @@ impl ExactVLite {
             None,
             &self.chunker,
         );
-        self.add_ingested_document(ingested)
+        self.add_ingested_document(ingested, true)
+    }
+
+    pub fn add_texts(
+        &mut self,
+        texts: Vec<String>,
+        metadata: Metadata,
+        document_ids: Option<Vec<String>>,
+    ) -> anyhow::Result<Vec<AddResult>> {
+        let document_ids = document_ids.unwrap_or_default();
+        let mut results = Vec::with_capacity(texts.len());
+
+        for (index, text) in texts.into_iter().enumerate() {
+            let document_id = document_ids
+                .get(index)
+                .cloned()
+                .unwrap_or_else(|| Uuid::new_v4().to_string());
+            let ingested =
+                ingest_text_document(document_id, text, metadata.clone(), None, &self.chunker);
+            let result = self.add_ingested_document(ingested, false)?;
+            results.push(result);
+        }
+
+        self.persist()?;
+        Ok(results)
     }
 
     pub fn add_pdf(
@@ -92,7 +116,7 @@ impl ExactVLite {
     ) -> anyhow::Result<AddResult> {
         let document_id = document_id.unwrap_or_else(|| Uuid::new_v4().to_string());
         let ingested = ingest_pdf_pages(document_id, pages, metadata, source_uri, &self.chunker);
-        self.add_ingested_document(ingested)
+        self.add_ingested_document(ingested, true)
     }
 
     pub fn add_image(
@@ -104,10 +128,14 @@ impl ExactVLite {
     ) -> anyhow::Result<AddResult> {
         let document_id = document_id.unwrap_or_else(|| Uuid::new_v4().to_string());
         let ingested = ingest_image_reference(document_id, source_uri, metadata, caption);
-        self.add_ingested_document(ingested)
+        self.add_ingested_document(ingested, true)
     }
 
-    fn add_ingested_document(&mut self, ingested: IngestedDocument) -> anyhow::Result<AddResult> {
+    fn add_ingested_document(
+        &mut self,
+        ingested: IngestedDocument,
+        persist_now: bool,
+    ) -> anyhow::Result<AddResult> {
         let document_id = ingested.document.id.clone();
         let root_segment_id = format!("{document_id}:root");
         let root_segment = Segment {
@@ -135,7 +163,9 @@ impl ExactVLite {
         self.documents
             .insert(document_id.clone(), ingested.document);
         self.segments.insert(root_segment_id, root_segment);
-        self.persist()?;
+        if persist_now {
+            self.persist()?;
+        }
 
         Ok(AddResult {
             document_id,

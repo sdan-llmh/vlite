@@ -177,6 +177,22 @@ impl RustVLite {
         Ok(result.into())
     }
 
+    #[pyo3(signature = (texts, metadata=None, document_ids=None))]
+    fn add_many(
+        &self,
+        texts: Vec<String>,
+        metadata: Option<HashMap<String, String>>,
+        document_ids: Option<Vec<String>>,
+    ) -> PyResult<Vec<PyAddResult>> {
+        let results = self
+            .inner
+            .lock()
+            .expect("mutex poisoned")
+            .add_texts(texts, into_metadata(metadata), document_ids)
+            .map_err(to_py_error)?;
+        Ok(results.into_iter().map(Into::into).collect())
+    }
+
     #[pyo3(signature = (pages, metadata=None, document_id=None, source_uri=None))]
     fn add_pdf_pages(
         &self,
